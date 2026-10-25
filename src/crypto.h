@@ -490,3 +490,19 @@ int crypto_tr_tweak_seckey(const uint8_t seckey[static 32],
  * @return SW (SW_OK on success, other value on error).
  */
 uint16_t cx_err_to_sw(cx_err_t error);
+
+/** Interactive anti-exfil for single-signer BIP340 signatures.
+ * The host commitment is tagged_hash("BIP-EXFIL/host", rho),
+ * where rho encodes a nonzero scalar smaller than the curve order.
+ * No signing secrets or session state are persisted between the two rounds.
+ */
+int crypto_schnorr_anti_exfil_commit(const uint8_t seckey[static 32],
+                                     const uint8_t message[static 32],
+                                     const uint8_t host_commitment[static 32],
+                                     uint8_t nonce[static 33]);
+int crypto_schnorr_anti_exfil_sign(const uint8_t seckey[static 32],
+                                   const uint8_t message[static 32],
+                                   const uint8_t host_commitment[static 32],
+                                   const uint8_t host_entropy[static 32],
+                                   const uint8_t expected_nonce[static 33],
+                                   uint8_t signature[static 64]);
