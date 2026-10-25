@@ -10,7 +10,8 @@ on:
 
 jobs:
   job_functional_tests:
-    uses: LedgerHQ/app-exchange/.github/workflows/reusable_swap_functional_tests.yml@develop
+    uses: ./.github/workflows/_reusable_swap_functional_tests.yml
     with:
+      repo_for_bitcoin: ${{ github.repository }}
       branch_for_bitcoin: ${{ github.ref }}
       test_filter: '"btc or bitcoin or Bitcoin"'
