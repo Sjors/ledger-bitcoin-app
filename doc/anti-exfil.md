@@ -34,14 +34,30 @@ different nonce derivation domain from ordinary BIP340 signing.
 
 Only `SIGHASH_DEFAULT` and `SIGHASH_ALL` are accepted in this flow. Partial field
 sets, malformed fields, an incorrect signing key, or script-path requests fail
-closed. PSBTs without anti-exfil fields retain the existing signing behavior.
+closed. Before yielding any nonce or signature, the app scans the complete PSBT:
+`ae` is allowed only in input maps, keys must have canonical CompactSize
+encodings, values must have the required lengths, each target must use its
+actual output key, and all targets must use the same round. Targets containing
+key-path/script-path signatures or final script fields are rejected. This app
+requires an owned single-signer Taproot key path with a witness UTXO; targets
+with redeem/witness/tap-leaf scripts or MuSig2 nonce/signature fields are not
+supported. Unsupported targets are rejected before any result is returned.
+
+When any protected target exists, the app signs only those inputs and their
+key-path keys. Untargeted inputs and script-path/MuSig2 keys are skipped. This
+is native PSBT-profile conformance; the host must still verify every returned
+result against its independently retained request and transcript. PSBTs without anti-exfil fields retain the existing signing behavior.
 
 ## Tests
 
 `unit-tests/test_crypto.c` includes eight independent cross-implementation
 vectors (including odd signing keys, both final nonce parities, and `rho=n-1`),
 deterministic retries, wrong reveals and openings, altered messages, and invalid
-host scalars. The HWI `--ledger-anti-exfil` device test exercises two-round signing
+host scalars. `unit-tests/test_anti_exfil.c` covers namespace recognition and
+noncanonical encodings. `tests/test_anti_exfil_raw.py` sends Merkleized maps
+directly over APDU, bypassing host preflight, and checks every yielded receipt:
+two owned inputs with one target, legacy/SegWit untargeted inputs, malformed
+namespace/fields, unsupported/signed/finalized targets and mixed rounds. The HWI `--ledger-anti-exfil` device test exercises two-round signing
 against the Speculos app, negative device requests, and broadcast/confirmation.
 
 The host must keep the original request and nonce receipt between rounds. On a

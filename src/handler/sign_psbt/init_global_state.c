@@ -20,6 +20,7 @@
 #include <string.h>
 
 #include "init_global_state.h"
+#include "anti_exfil.h"
 #include "bip322.h"
 
 /* SDK headers */
@@ -126,6 +127,8 @@ static void global_map_keys_callback(dispatcher_context_t *dc,
     UNUSED(index);
 
     sign_psbt_state_t *st = (sign_psbt_state_t *) callback_state;
+    st->has_anti_exfil_fields |=
+        anti_exfil_is_key(data->ptr + data->offset, data->size - data->offset);
     // PSBT_GLOBAL_GENERIC_SIGNED_MESSAGE has no keydata: the key is exactly the key type
     if (data->size - data->offset == 1 &&
         data->ptr[data->offset] == PSBT_GLOBAL_GENERIC_SIGNED_MESSAGE) {

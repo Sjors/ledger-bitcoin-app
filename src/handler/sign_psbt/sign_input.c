@@ -96,6 +96,11 @@ bool __attribute__((noinline)) sign_sighash_ecdsa_and_yield(dispatcher_context_t
                                                             uint8_t sighash[static 32]) {
     LOG_PROCESSOR(__FILE__, __LINE__, __func__);
 
+    if (st->anti_exfil_round != 0) {
+        SEND_SW(dc, SW_INCORRECT_DATA);
+        return false;
+    }
+
     uint8_t sig[MAX_DER_SIG_LEN + 1];  // extra byte for the appended sighash-type
 
     uint8_t pubkey[33];
@@ -118,33 +123,6 @@ bool __attribute__((noinline)) sign_sighash_ecdsa_and_yield(dispatcher_context_t
     if (!yield_signature(dc, st, input_index, pubkey, 33, NULL, sig, sig_len)) return false;
 
     return true;
-}
-
-/* Draft PSBT proprietary input key: 0xfc || 0x02 || "ae" || subtype || xonly_key. */
-typedef struct {
-    const uint8_t *pubkey;
-    uint8_t fields;
-    bool invalid;
-} anti_exfil_fields_t;
-
-static void anti_exfil_keys_callback(dispatcher_context_t *dc,
-                                     void *state,
-                                     const merkleized_map_commitment_t *map,
-                                     int index,
-                                     buffer_t *data) {
-    (void) dc;
-    (void) map;
-    (void) index;
-    anti_exfil_fields_t *ae = state;
-    const uint8_t *key = data->ptr + data->offset;
-    size_t len = data->size - data->offset;
-    const uint8_t prefix[] = {0xfc, 0x02, 'a', 'e'};
-    if (len < sizeof(prefix) || memcmp(key, prefix, sizeof(prefix)) != 0) return;
-    if (len != 37 || key[4] > 2 || memcmp(key + 5, ae->pubkey, 32) != 0) {
-        ae->invalid = true;
-        return;
-    }
-    ae->fields |= 1u << key[4];
 }
 
 static bool yield_anti_exfil_nonce(dispatcher_context_t *dc,
@@ -226,25 +204,18 @@ bool __attribute__((noinline)) sign_sighash_schnorr_and_yield(dispatcher_context
             break;
         }
 
-        merkleized_map_commitment_t input_map;
-        anti_exfil_fields_t ae = {.pubkey = pubkey_tweaked.W + 1};
-        if (call_get_merkleized_map_with_callback(dc,
-                                                  &ae,
-                                                  st->inputs_root,
-                                                  st->n_inputs,
-                                                  input_index,
-                                                  anti_exfil_keys_callback,
-                                                  &input_map) < 0 ||
-            ae.invalid) {
-            error = true;
-            break;
-        }
-        if (ae.fields != 0) {
-            // This draft supports only single-signer key-path signatures with a
-            // sighash committing to all outputs. Other flows fail closed.
-            if (st->protocol_version < 1 || tapleaf_hash != NULL ||
+        // The complete invocation was validated before authorization/signing.
+        // Look up fields under the derived tweaked key as an independent check
+        // that the protected target is the key actually used for signing.
+        if (st->anti_exfil_round != 0) {
+            merkleized_map_commitment_t input_map;
+            if (tapleaf_hash != NULL ||
                 (sighash_byte != SIGHASH_DEFAULT && sighash_byte != SIGHASH_ALL) ||
-                (ae.fields != 1 && ae.fields != 7)) {
+                call_get_merkleized_map(dc,
+                                        st->inputs_root,
+                                        st->n_inputs,
+                                        input_index,
+                                        &input_map) < 0) {
                 error = true;
                 break;
             }
@@ -260,7 +231,7 @@ bool __attribute__((noinline)) sign_sighash_schnorr_and_yield(dispatcher_context
                 error = true;
                 break;
             }
-            if (ae.fields == 1) {
+            if (st->anti_exfil_round == 1) {
                 nonce_only = true;
                 error = crypto_schnorr_anti_exfil_commit(seckey,
                                                          sighash,
@@ -710,7 +681,8 @@ bool __attribute__((noinline)) produce_musig2_pubnonces(
 
     // Iterate over all internal inputs
     for (unsigned int i = 0; i < st->n_inputs; i++) {
-        if (!bitvector_get(internal_inputs, i)) {
+        if (!bitvector_get(internal_inputs, i) ||
+            (st->anti_exfil_round != 0 && !bitvector_get(st->anti_exfil_inputs, i))) {
             continue;
         }
 
@@ -733,7 +705,11 @@ bool __attribute__((noinline)) produce_musig2_pubnonces(
 
         for (size_t i_keyexpr = 0; i_keyexpr < st->account.n_internal_key_expressions;
              i_keyexpr++) {
-            if (!keyexpr_to_process[i_keyexpr]) {
+            if (!keyexpr_to_process[i_keyexpr] ||
+                (st->anti_exfil_round != 0 &&
+                 (st->account.internal_key_expressions[i_keyexpr].is_tapscript ||
+                  st->account.internal_key_expressions[i_keyexpr].key_expression_ptr->type !=
+                      KEY_EXPRESSION_NORMAL))) {
                 continue;
             }
             keyexpr_info_t *keyexpr_info = &st->account.internal_key_expressions[i_keyexpr];
@@ -802,7 +778,8 @@ bool __attribute__((noinline)) sign_transaction(
 
     // Iterate over all internal inputs
     for (unsigned int i = 0; i < st->n_inputs; i++) {
-        if (!bitvector_get(internal_inputs, i)) {
+        if (!bitvector_get(internal_inputs, i) ||
+            (st->anti_exfil_round != 0 && !bitvector_get(st->anti_exfil_inputs, i))) {
             continue;
         }
 
@@ -825,7 +802,11 @@ bool __attribute__((noinline)) sign_transaction(
 
         for (size_t i_keyexpr = 0; i_keyexpr < st->account.n_internal_key_expressions;
              i_keyexpr++) {
-            if (!keyexpr_to_process[i_keyexpr]) {
+            if (!keyexpr_to_process[i_keyexpr] ||
+                (st->anti_exfil_round != 0 &&
+                 (st->account.internal_key_expressions[i_keyexpr].is_tapscript ||
+                  st->account.internal_key_expressions[i_keyexpr].key_expression_ptr->type !=
+                      KEY_EXPRESSION_NORMAL))) {
                 continue;
             }
             keyexpr_info_t *keyexpr_info = &st->account.internal_key_expressions[i_keyexpr];

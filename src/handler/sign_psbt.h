@@ -19,6 +19,7 @@
 
 /* Local headers */
 #include "display.h"
+#include "bitvector.h"
 #include "merkle.h"
 #include "musig_sessions.h"
 #include "psbt_fields.h"
@@ -228,6 +229,13 @@ typedef struct {
         uint8_t output_scripts[N_CACHED_EXTERNAL_OUTPUTS][MAX_OUTPUT_SCRIPTPUBKEY_LEN];
         uint64_t output_amounts[N_CACHED_EXTERNAL_OUTPUTS];
     } outputs;
+
+    // Set during the existing map scans, including for malformed ae keys.
+    bool has_anti_exfil_fields;
+
+    // A nonzero round enables invocation-wide protected signing.
+    uint8_t anti_exfil_round;
+    uint8_t anti_exfil_inputs[BITVECTOR_REAL_SIZE(MAX_N_INPUTS_CAN_SIGN)];
 
     uint8_t protocol_version;
 
