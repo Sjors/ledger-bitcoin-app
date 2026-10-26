@@ -20,6 +20,7 @@
 
 #include "sign_psbt.h"
 #include "sign_psbt/bip322_validation.h"
+#include "sign_psbt/anti_exfil_preflight.h"
 #include "sign_psbt/init_global_state.h"
 #include "sign_psbt/musig_signing.h"
 #include "sign_psbt/preprocess_inputs.h"
@@ -87,6 +88,8 @@ static void sign_psbt(dispatcher_context_t *dc,
      *  Check if it's an acceptable output.
      */
     if (!preprocess_outputs(dc, st, cache, internal_outputs)) return;
+
+    if (!anti_exfil_preflight(dc, st, internal_inputs)) return;
 
     /** BIP-322 STRUCTURAL VALIDATION
      *

@@ -657,3 +657,128 @@ int crypto_tr_tweak_seckey(const uint8_t seckey[static 32],
 
     return ret;
 }
+
+/* This nonce derivation deliberately uses a separate tag from ordinary BIP340
+ * signing. Reusing BIP340/nonce here would permit related-nonce signatures if
+ * an ordinary signing API were called with the same auxiliary randomness.
+ */
+static int anti_exfil_derive_nonce(const uint8_t seckey[static 32],
+                                   const uint8_t message[static 32],
+                                   const uint8_t host_commitment[static 32],
+                                   uint8_t d[static 32],
+                                   uint8_t pubkey[static 65],
+                                   uint8_t k0[static 32]) {
+    uint8_t masked[32];
+    cx_sha256_t hash_context;
+    int ret = -1;
+    do {
+        if (secp256k1_point(seckey, pubkey) < 0) break;
+        memcpy(d, seckey, 32);
+        if ((pubkey[64] & 1) && cx_math_sub_no_throw(d, secp256k1_n, d, 32) != CX_OK) break;
+        static const uint8_t aux_tag[] = "BIP0340/aux";
+        crypto_tr_tagged_hash(aux_tag, sizeof(aux_tag) - 1, host_commitment, 32, NULL, 0, masked);
+        for (size_t i = 0; i < 32; ++i) masked[i] ^= d[i];
+        static const uint8_t nonce_tag[] = "BIP-EXFIL/nonce";
+        crypto_tr_tagged_hash_init(&hash_context, nonce_tag, sizeof(nonce_tag) - 1);
+        crypto_hash_update(&hash_context.header, masked, 32);
+        crypto_hash_update(&hash_context.header, pubkey + 1, 32);
+        crypto_hash_update(&hash_context.header, message, 32);
+        crypto_hash_digest(&hash_context.header, k0, 32);
+        if (cx_math_modm_no_throw(k0, 32, secp256k1_n, 32) != CX_OK) break;
+        if (cx_math_is_zero(k0, 32)) break;
+        ret = 0;
+    } while (false);
+    explicit_bzero(masked, sizeof(masked));
+    explicit_bzero(&hash_context, sizeof(hash_context));
+    return ret;
+}
+
+int crypto_schnorr_anti_exfil_commit(const uint8_t seckey[static 32],
+                                     const uint8_t message[static 32],
+                                     const uint8_t host_commitment[static 32],
+                                     uint8_t nonce[static 33]) {
+    struct {
+        uint8_t d[32];
+        uint8_t k0[32];
+    } secrets = {0};
+    uint8_t pubkey[65], point[65];
+    int ret = -1;
+    do {
+        if (anti_exfil_derive_nonce(seckey,
+                                    message,
+                                    host_commitment,
+                                    secrets.d,
+                                    pubkey,
+                                    secrets.k0) < 0)
+            break;
+        if (secp256k1_point(secrets.k0, point) < 0) break;
+        if (crypto_get_compressed_pubkey(point, nonce) < 0) break;
+        ret = 0;
+    } while (false);
+    explicit_bzero(&secrets, sizeof(secrets));
+    if (ret != 0) explicit_bzero(nonce, 33);
+    return ret;
+}
+
+int crypto_schnorr_anti_exfil_sign(const uint8_t seckey[static 32],
+                                   const uint8_t message[static 32],
+                                   const uint8_t host_commitment[static 32],
+                                   const uint8_t host_entropy[static 32],
+                                   const uint8_t expected_nonce[static 33],
+                                   uint8_t signature[static 64]) {
+    struct {
+        uint8_t d[32];
+        uint8_t k[32];
+        uint8_t ed[32];
+    } secrets = {0};
+    uint8_t pubkey[65], point[65], nonce[33], commitment[32], challenge[32];
+    cx_sha256_t hash_context;
+    int ret = -1;
+    do {
+        int diff;
+        if (cx_math_is_zero(host_entropy, 32) ||
+            cx_math_cmp_no_throw(host_entropy, secp256k1_n, 32, &diff) != CX_OK || diff >= 0)
+            break;
+        static const uint8_t host_tag[] = "BIP-EXFIL/host";
+        crypto_tr_tagged_hash(host_tag,
+                              sizeof(host_tag) - 1,
+                              host_entropy,
+                              32,
+                              NULL,
+                              0,
+                              commitment);
+        if (memcmp(commitment, host_commitment, 32) != 0) break;
+        if (anti_exfil_derive_nonce(seckey,
+                                    message,
+                                    host_commitment,
+                                    secrets.d,
+                                    pubkey,
+                                    secrets.k) < 0)
+            break;
+        if (secp256k1_point(secrets.k, point) < 0 || crypto_get_compressed_pubkey(point, nonce) < 0)
+            break;
+        if (memcmp(nonce, expected_nonce, 33) != 0) break;
+        if (cx_math_addm_no_throw(secrets.k, secrets.k, host_entropy, secp256k1_n, 32) != CX_OK ||
+            cx_math_is_zero(secrets.k, 32))
+            break;
+        if (secp256k1_point(secrets.k, point) < 0) break;
+        if ((point[64] & 1) && cx_math_sub_no_throw(secrets.k, secp256k1_n, secrets.k, 32) != CX_OK)
+            break;
+        memcpy(signature, point + 1, 32);
+        static const uint8_t challenge_tag[] = "BIP0340/challenge";
+        crypto_tr_tagged_hash_init(&hash_context, challenge_tag, sizeof(challenge_tag) - 1);
+        crypto_hash_update(&hash_context.header, signature, 32);
+        crypto_hash_update(&hash_context.header, pubkey + 1, 32);
+        crypto_hash_update(&hash_context.header, message, 32);
+        crypto_hash_digest(&hash_context.header, challenge, 32);
+        if (cx_math_modm_no_throw(challenge, 32, secp256k1_n, 32) != CX_OK ||
+            cx_math_multm_no_throw(secrets.ed, challenge, secrets.d, secp256k1_n, 32) != CX_OK ||
+            cx_math_addm_no_throw(signature + 32, secrets.k, secrets.ed, secp256k1_n, 32) != CX_OK)
+            break;
+        ret = 0;
+    } while (false);
+    explicit_bzero(&secrets, sizeof(secrets));
+    explicit_bzero(&hash_context, sizeof(hash_context));
+    if (ret != 0) explicit_bzero(signature, 64);
+    return ret;
+}

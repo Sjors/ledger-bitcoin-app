@@ -15,3 +15,4 @@ typedef enum {
 // Tags used when yielding different objects with the YIELD client command.
 #define CCMD_YIELD_MUSIG_PUBNONCE_TAG         0xffffffff
 #define CCMD_YIELD_MUSIG_PARTIALSIGNATURE_TAG 0xfffffffe
+#define CCMD_YIELD_ANTI_EXFIL_NONCE_TAG       0xfffffffd

@@ -128,6 +128,10 @@ function(add_unit_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+add_library(anti_exfil SHARED ../src/common/anti_exfil.c)
+target_include_directories(anti_exfil PUBLIC ../src/common)
+add_unit_test(test_anti_exfil LIBS test_common anti_exfil)
+
 add_unit_test(test_bitvector     LIBS test_common)
 add_unit_test(test_buffer        LIBS test_common buffer buffer_ext varint read write bip32)
 add_unit_test(test_display_utils LIBS test_common display_utils)

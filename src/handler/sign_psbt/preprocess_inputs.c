@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "preprocess_inputs.h"
+#include "anti_exfil.h"
 
 /* SDK headers */
 #include "read.h"
@@ -53,6 +54,8 @@ void input_keys_callback(dispatcher_context_t *dc,
                          int index,
                          buffer_t *data) {
     size_t data_len = data->size - data->offset;
+    callback_data->state->has_anti_exfil_fields |=
+        anti_exfil_is_key(data->ptr + data->offset, data_len);
     if (data_len >= 1) {
         uint8_t key_type;
         buffer_read_u8(data, &key_type);

@@ -34,6 +34,7 @@
 #include "dispatcher.h"
 #include "error_codes.h"
 #include "get_merkleized_map.h"
+#include "get_merkleized_map_value.h"
 #include "init_global_state.h"
 #include "musig_signing.h"
 #include "policy.h"
@@ -95,6 +96,11 @@ bool __attribute__((noinline)) sign_sighash_ecdsa_and_yield(dispatcher_context_t
                                                             uint8_t sighash[static 32]) {
     LOG_PROCESSOR(__FILE__, __LINE__, __func__);
 
+    if (st->anti_exfil_round != 0) {
+        SEND_SW(dc, SW_INCORRECT_DATA);
+        return false;
+    }
+
     uint8_t sig[MAX_DER_SIG_LEN + 1];  // extra byte for the appended sighash-type
 
     uint8_t pubkey[33];
@@ -116,6 +122,26 @@ bool __attribute__((noinline)) sign_sighash_ecdsa_and_yield(dispatcher_context_t
 
     if (!yield_signature(dc, st, input_index, pubkey, 33, NULL, sig, sig_len)) return false;
 
+    return true;
+}
+
+static bool yield_anti_exfil_nonce(dispatcher_context_t *dc,
+                                   unsigned int input_index,
+                                   const uint8_t nonce[static 33],
+                                   const uint8_t pubkey[static 32]) {
+    uint8_t cmd = CCMD_YIELD, buf[9];
+    dc->add_to_response(&cmd, 1);
+    int len = varint_write(buf, 0, CCMD_YIELD_ANTI_EXFIL_NONCE_TAG);
+    dc->add_to_response(buf, len);
+    len = varint_write(buf, 0, input_index);
+    dc->add_to_response(buf, len);
+    dc->add_to_response(nonce, 33);
+    dc->add_to_response(pubkey, 32);
+    dc->finalize_response(SW_INTERRUPTED_EXECUTION);
+    if (dc->process_interruption(dc) < 0) {
+        SEND_SW(dc, SW_BAD_STATE);
+        return false;
+    }
     return true;
 }
 
@@ -142,6 +168,8 @@ bool __attribute__((noinline)) sign_sighash_schnorr_and_yield(dispatcher_context
     cx_ecfp_public_key_t pubkey_tweaked;  // Pubkey corresponding to the key used for signing
 
     bool error = false;
+    bool nonce_only = false;
+    uint8_t anti_exfil_nonce[33];
     cx_ecfp_private_key_t private_key = {0};
 
     // IMPORTANT: Since we do not use any syscall that might throw an exception, it is safe to avoid
@@ -162,7 +190,10 @@ bool __attribute__((noinline)) sign_sighash_schnorr_and_yield(dispatcher_context
         }
 
         if (tweak_data != NULL) {
-            crypto_tr_tweak_seckey(seckey, tweak_data, tweak_data_len, seckey);
+            if (crypto_tr_tweak_seckey(seckey, tweak_data, tweak_data_len, seckey) < 0) {
+                error = true;
+                break;
+            }
         }
 
         // generate corresponding public key
@@ -173,24 +204,83 @@ bool __attribute__((noinline)) sign_sighash_schnorr_and_yield(dispatcher_context
             break;
         }
 
-        // BIP-340 default signing: the first 32 bytes of sig are the auxiliary randomness, and
-        // with CX_RND_PROVIDED the SDK derives the synthetic nonce
-        // k = hash_BIP0340/nonce((d XOR hash_BIP0340/aux(aux_rand)) || P || m) mod n.
-        // This makes sure nonces are unique per message even in the event of RNG failure.
-        if (cx_get_random_bytes(sig, 32) != CX_OK) {
-            error = true;
-            break;
-        }
-
-        err = cx_ecschnorr_sign_no_throw(&private_key,
-                                         CX_ECSCHNORR_BIP0340 | CX_RND_PROVIDED,
-                                         CX_SHA256,
-                                         sighash,
-                                         32,
-                                         sig,
-                                         &sig_len);
-        if (err != CX_OK) {
-            error = true;
+        // The complete invocation was validated before authorization/signing.
+        // Look up fields under the derived tweaked key as an independent check
+        // that the protected target is the key actually used for signing.
+        if (st->anti_exfil_round != 0) {
+            merkleized_map_commitment_t input_map;
+            if (tapleaf_hash != NULL ||
+                (sighash_byte != SIGHASH_DEFAULT && sighash_byte != SIGHASH_ALL) ||
+                call_get_merkleized_map(dc,
+                                        st->inputs_root,
+                                        st->n_inputs,
+                                        input_index,
+                                        &input_map) < 0) {
+                error = true;
+                break;
+            }
+            uint8_t key[37] = {0xfc, 0x02, 'a', 'e', 0};
+            memcpy(key + 5, pubkey_tweaked.W + 1, 32);
+            uint8_t host_commitment[32], host_entropy[32], expected_nonce[33];
+            if (call_get_merkleized_map_value(dc,
+                                              &input_map,
+                                              key,
+                                              sizeof(key),
+                                              host_commitment,
+                                              32) != 32) {
+                error = true;
+                break;
+            }
+            if (st->anti_exfil_round == 1) {
+                nonce_only = true;
+                error = crypto_schnorr_anti_exfil_commit(seckey,
+                                                         sighash,
+                                                         host_commitment,
+                                                         anti_exfil_nonce) < 0;
+            } else {
+                key[4] = 1;
+                if (call_get_merkleized_map_value(dc,
+                                                  &input_map,
+                                                  key,
+                                                  sizeof(key),
+                                                  expected_nonce,
+                                                  33) != 33) {
+                    error = true;
+                    break;
+                }
+                key[4] = 2;
+                if (call_get_merkleized_map_value(dc,
+                                                  &input_map,
+                                                  key,
+                                                  sizeof(key),
+                                                  host_entropy,
+                                                  32) != 32) {
+                    error = true;
+                    break;
+                }
+                error = crypto_schnorr_anti_exfil_sign(seckey,
+                                                       sighash,
+                                                       host_commitment,
+                                                       host_entropy,
+                                                       expected_nonce,
+                                                       sig) < 0;
+                sig_len = 64;
+            }
+            explicit_bzero(host_entropy, sizeof(host_entropy));
+        } else {
+            // Preserve ordinary BIP340 synthetic nonces when anti-exfil is absent.
+            if (cx_get_random_bytes(sig, 32) != CX_OK) {
+                error = true;
+                break;
+            }
+            err = cx_ecschnorr_sign_no_throw(&private_key,
+                                             CX_ECSCHNORR_BIP0340 | CX_RND_PROVIDED,
+                                             CX_SHA256,
+                                             sighash,
+                                             32,
+                                             sig,
+                                             &sig_len);
+            if (err != CX_OK) error = true;
         }
     } while (false);
 
@@ -200,6 +290,10 @@ bool __attribute__((noinline)) sign_sighash_schnorr_and_yield(dispatcher_context
         // unexpected error when signing
         SEND_SW(dc, SW_BAD_STATE);
         return false;
+    }
+
+    if (nonce_only) {
+        return yield_anti_exfil_nonce(dc, input_index, anti_exfil_nonce, pubkey_tweaked.W + 1);
     }
 
     if (sig_len != 64) {
@@ -587,7 +681,8 @@ bool __attribute__((noinline)) produce_musig2_pubnonces(
 
     // Iterate over all internal inputs
     for (unsigned int i = 0; i < st->n_inputs; i++) {
-        if (!bitvector_get(internal_inputs, i)) {
+        if (!bitvector_get(internal_inputs, i) ||
+            (st->anti_exfil_round != 0 && !bitvector_get(st->anti_exfil_inputs, i))) {
             continue;
         }
 
@@ -610,7 +705,11 @@ bool __attribute__((noinline)) produce_musig2_pubnonces(
 
         for (size_t i_keyexpr = 0; i_keyexpr < st->account.n_internal_key_expressions;
              i_keyexpr++) {
-            if (!keyexpr_to_process[i_keyexpr]) {
+            if (!keyexpr_to_process[i_keyexpr] ||
+                (st->anti_exfil_round != 0 &&
+                 (st->account.internal_key_expressions[i_keyexpr].is_tapscript ||
+                  st->account.internal_key_expressions[i_keyexpr].key_expression_ptr->type !=
+                      KEY_EXPRESSION_NORMAL))) {
                 continue;
             }
             keyexpr_info_t *keyexpr_info = &st->account.internal_key_expressions[i_keyexpr];
@@ -679,7 +778,8 @@ bool __attribute__((noinline)) sign_transaction(
 
     // Iterate over all internal inputs
     for (unsigned int i = 0; i < st->n_inputs; i++) {
-        if (!bitvector_get(internal_inputs, i)) {
+        if (!bitvector_get(internal_inputs, i) ||
+            (st->anti_exfil_round != 0 && !bitvector_get(st->anti_exfil_inputs, i))) {
             continue;
         }
 
@@ -702,7 +802,11 @@ bool __attribute__((noinline)) sign_transaction(
 
         for (size_t i_keyexpr = 0; i_keyexpr < st->account.n_internal_key_expressions;
              i_keyexpr++) {
-            if (!keyexpr_to_process[i_keyexpr]) {
+            if (!keyexpr_to_process[i_keyexpr] ||
+                (st->anti_exfil_round != 0 &&
+                 (st->account.internal_key_expressions[i_keyexpr].is_tapscript ||
+                  st->account.internal_key_expressions[i_keyexpr].key_expression_ptr->type !=
+                      KEY_EXPRESSION_NORMAL))) {
                 continue;
             }
             keyexpr_info_t *keyexpr_info = &st->account.internal_key_expressions[i_keyexpr];
